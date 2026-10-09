@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from survey.core import (Question, SurveyError, read_sheets, definitions, map_questions,
                          build_dataset, aggregate, filter_index, membership)
@@ -47,6 +48,17 @@ def marked_fixture():
                     if frame.iloc[row, col]:
                         frame.iloc[row, col] = ["〇", "○", " 〇 "][(row + col) % 3]
     return build_dataset(ds.questions, frame), frame
+
+
+def dense_fixture():
+    choices = [f"回答{i + 1}" for i in range(6)]
+    groups = [f"属性{i + 1}" for i in range(10)]
+    questions = [Question("q", "比較する設問", "single", choices),
+                 Question("g", "比較する属性", "single", groups)]
+    frame = pd.DataFrame([["No.1：比較する設問", "No.2：比較する属性"], ["", ""]]
+                         + [[choice, group] for group in groups for choice in choices])
+    map_questions(questions, frame)
+    return build_dataset(questions, frame)
 
 
 class CoreTests(unittest.TestCase):
@@ -209,6 +221,80 @@ class CoreTests(unittest.TestCase):
 
 
 class ExportTests(unittest.TestCase):
+    def test_render_uses_agg_even_with_base_canvas_backend(self):
+        previous = plt.get_backend()
+        plt.switch_backend("template")
+        try:
+            # This backend reproduces the reported missing get_renderer().
+            original = plt.figure()
+            self.assertFalse(hasattr(original.canvas, "get_renderer"))
+            plt.close(original)
+            ds, _ = fixture()
+            for height in [12, 60]:
+                spec = FigureSpec("1", group="3", mode="cross", height=height,
+                                  dpi=72, auto_height=False, font=default_font())
+                fig = render(ds, spec)
+                try:
+                    self.assertIsInstance(fig.canvas, FigureCanvasAgg)
+                    for fmt in ["png", "svg", "pdf"]:
+                        self.assertTrue(export_figure(fig, spec, fmt))
+                finally:
+                    plt.close(fig)
+        finally:
+            plt.switch_backend(previous)
+
+    def test_dense_cross_value_labels_do_not_overlap(self):
+        ds = dense_fixture()
+        spec = FigureSpec("q", group="g", mode="cross", metric="count",
+                          height=12, auto_height=True, font=default_font())
+        fig = render(ds, spec)
+        try:
+            self.assertGreater(fig.get_figheight() * 2.54, 12)
+            self.assertLessEqual(fig.get_figheight() * 2.54, 60)
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            labels = sorted((label.get_window_extent(renderer) for label in fig.axes[0].texts), key=lambda box: box.y0)
+            self.assertEqual(len(labels), 60)
+            for first, second in zip(labels, labels[1:]):
+                self.assertLess(first.y1, second.y0)
+            axis = fig.axes[0]
+            legend_gap = (axis.xaxis.label.get_window_extent(renderer).y0 - axis.get_legend().get_window_extent(renderer).y1) / fig.dpi
+            self.assertGreater(legend_gap, 0)
+            self.assertLess(legend_gap, 1)
+            for fmt in ["png", "svg", "pdf"]:
+                self.assertTrue(export_figure(fig, spec, fmt, dpi=72))
+        finally:
+            plt.close(fig)
+        spec.auto_height = False
+        fig = render(ds, spec)
+        try:
+            self.assertAlmostEqual(fig.get_figheight() * 2.54, 12)
+        finally:
+            plt.close(fig)
+
+    def test_oversized_png_keeps_preview_and_vector_exports(self):
+        ds, _ = fixture()
+        spec = FigureSpec("1", width=60, height=60, dpi=600, auto_height=False,
+                          font=default_font())
+        fig = render(ds, spec)
+        try:
+            with self.assertRaisesRegex(SurveyError, "PNGのサイズが大きすぎます"):
+                export_figure(fig, spec, "png")
+            self.assertTrue(export_figure(fig, spec, "png", dpi=72).startswith(b"\x89PNG"))
+            for fmt in ["svg", "pdf"]:
+                self.assertTrue(export_figure(fig, spec, fmt))
+        finally:
+            plt.close(fig)
+
+    def test_old_settings_default_layout_controls(self):
+        ds, _ = fixture()
+        payload = json.loads(save_settings(ds, [FigureSpec("1")], {}, {}))
+        payload["figures"][0].pop("auto_height")
+        payload["figures"][0].pop("value_font_size")
+        specs, _, _ = load_settings(json.dumps(payload).encode(), ds)
+        self.assertTrue(specs[0].auto_height)
+        self.assertEqual(specs[0].value_font_size, 9)
+
     def test_all_charts_export_and_close(self):
         ds, _ = fixture()
         for spec in [FigureSpec("1", font=default_font()),

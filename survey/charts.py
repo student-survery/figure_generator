@@ -6,17 +6,25 @@ import json
 import math
 import re
 import textwrap
+from threading import RLock
 import zipfile
 
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import colors, font_manager
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from matplotlib.transforms import ScaledTranslation
 import numpy as np
 import pandas as pd
 
 from .core import Dataset, SurveyError, aggregate, filter_index, MISSING
+
+
+_DRAW_LOCK = RLock()
+MAX_PNG_PIXELS = 40_000_000
+MAX_PNG_SIDE = 16_000
 
 
 PALETTES = {
@@ -69,6 +77,8 @@ class FigureSpec:
     padding: float = 1.2
     bins: int = 10
     svg_text: bool = False
+    auto_height: bool = True
+    value_font_size: float = 9
 
 
 def validate_spec(spec: FigureSpec, ds: Dataset):
@@ -80,7 +90,7 @@ def validate_spec(spec: FigureSpec, ds: Dataset):
     for mapping in [spec.colors, spec.labels]:
         if not isinstance(mapping, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()):
             raise SurveyError("色・ラベル設定の形式が不正です。")
-    if not all(isinstance(value, bool) for value in [spec.include_missing, spec.show_values, spec.legend, spec.transparent, spec.grid, spec.svg_text]):
+    if not all(isinstance(value, bool) for value in [spec.include_missing, spec.show_values, spec.legend, spec.transparent, spec.grid, spec.svg_text, spec.auto_height]):
         raise SurveyError("図の表示設定の形式が不正です。")
     available = {q.id: q for q in ds.available()}
     if spec.question not in available or (spec.group and spec.group not in available):
@@ -103,7 +113,7 @@ def validate_spec(spec: FigureSpec, ds: Dataset):
         raise SurveyError("図の集計設定が不正です。")
     if spec.chart == "stacked" and spec.denominator == "all" and not spec.include_missing:
         raise SurveyError("対象者全員を分母にする100％積み上げ棒では、無回答も表示してください。")
-    for v, low, high in [(spec.width, 8, 60), (spec.height, 6, 60), (spec.font_size, 6, 30), (spec.dpi, 72, 600), (spec.wrap, 8, 60), (spec.padding, .2, 4), (spec.bins, 1, 100)]:
+    for v, low, high in [(spec.width, 8, 60), (spec.height, 6, 60), (spec.font_size, 6, 30), (spec.value_font_size, 6, 30), (spec.dpi, 72, 600), (spec.wrap, 8, 60), (spec.padding, .2, 4), (spec.bins, 1, 100)]:
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not low <= v <= high:
             raise SurveyError("図の寸法・解像度・文字サイズが範囲外です。")
     if spec.palette not in PALETTES or not colors.is_color_like(spec.background) or any(not colors.is_color_like(v) for v in spec.colors.values()):
@@ -141,14 +151,45 @@ def data_for_spec(ds: Dataset, spec: FigureSpec):
     return result, note
 
 
+def _fit_bar_height(fig, ax, canvas, spec, bar_pitch, annotations):
+    """Reserve physical vertical space for each value label and category tick."""
+    for _ in range(5):
+        fig.tight_layout(pad=spec.padding)
+        canvas.draw()
+        renderer = canvas.get_renderer()
+        if not spec.auto_height:
+            return renderer
+        span = abs(ax.get_ylim()[1] - ax.get_ylim()[0])
+        current = ax.get_window_extent(renderer).height
+        value_height = max((a.get_window_extent(renderer).height for a in annotations), default=0)
+        tick_height = max((t.get_window_extent(renderer).height for t in ax.get_yticklabels()), default=0)
+        required = max(value_height * 1.35 * span / bar_pitch, tick_height * 1.25 * span)
+        if required <= current + .5:
+            return renderer
+        if fig.get_figheight() * 2.54 >= 60 - .01:
+            raise SurveyError("棒グラフのラベルを配置するには高さ60cmを超えます。値ラベルの文字サイズを小さくする、値ラベルを非表示にする、またはヒートマップを選んでください。")
+        # Titles and legends have fixed physical height. Only increase the
+        # plotting area; scaling its fraction would also enlarge those margins.
+        new_height = fig.get_figheight() + (required - current) / fig.dpi + .02
+        fig.set_size_inches(fig.get_figwidth(), min(new_height, 60 / 2.54), forward=False)
+    raise SurveyError("棒グラフの自動高さ調整で十分な余白を確保できません。値ラベルの文字サイズを小さくするか、自動調整を解除して高さを指定してください。")
+
+
 def render(ds: Dataset, spec: FigureSpec):
     data, note = data_for_spec(ds, spec)
     q = ds.question(spec.question)
     family = spec.font or default_font()
     def label(value):
         return "\n".join(textwrap.wrap(spec.labels.get(str(value), str(value)), width=spec.wrap))
-    with plt.rc_context({"font.family": family, "font.size": spec.font_size, "axes.unicode_minus": False, "pdf.fonttype": 42, "svg.fonttype": "none" if spec.svg_text else "path"}):
-        fig, ax = plt.subplots(figsize=(spec.width / 2.54, spec.height / 2.54))
+    with _DRAW_LOCK, plt.rc_context({"font.family": family, "font.size": spec.font_size, "axes.unicode_minus": False, "pdf.fonttype": 42, "svg.fonttype": "none" if spec.svg_text else "path"}):
+        # Avoid pyplot's global backend/figure registry: it can leave a base
+        # canvas without get_renderer(), including across Streamlit reruns.
+        fig = Figure(figsize=(spec.width / 2.54, spec.height / 2.54), dpi=100)
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.subplots()
+        legend_transform = ax.transAxes + ScaledTranslation(0, -max(.55, spec.font_size / 72 * 3 + .15), fig.dpi_scale_trans)
+        annotations = []
+        bar_pitch = 1.0
         fig.set_facecolor(spec.background)
         ax.set_facecolor(spec.background)
         palette = PALETTES[spec.palette]
@@ -179,7 +220,7 @@ def render(ds: Dataset, spec: FigureSpec):
                     for r in range(table.shape[0]):
                         for c in range(table.shape[1]):
                             v = numeric[r, c]
-                            ax.text(c, r, "—" if not np.isfinite(v) else f"{v:.0f}" if spec.metric == "count" else f"{v:.1f}%", ha="center", va="center", color="white" if np.isfinite(v) and v > limit * .65 else "#172033")
+                            ax.text(c, r, "—" if not np.isfinite(v) else f"{v:.0f}" if spec.metric == "count" else f"{v:.1f}%", ha="center", va="center", fontsize=spec.value_font_size, color="white" if np.isfinite(v) and v > limit * .65 else "#172033")
             elif spec.chart == "stacked":
                 left = np.zeros(len(table.index))
                 for i, c in enumerate(table.columns):
@@ -190,7 +231,7 @@ def render(ds: Dataset, spec: FigureSpec):
                             if v >= 4:
                                 rgb = colors.to_rgb(color(c, i))
                                 foreground = "#172033" if sum(rgb) / 3 > .65 else "white"
-                                ax.text(left[j] + v / 2, j, f"{v:.1f}%", ha="center", va="center", color=foreground)
+                                ax.text(left[j] + v / 2, j, f"{v:.1f}%", ha="center", va="center", fontsize=spec.value_font_size, color=foreground)
                     left += values
                 for j, (_, row) in enumerate(table.iterrows()):
                     if row.isna().all():
@@ -199,9 +240,10 @@ def render(ds: Dataset, spec: FigureSpec):
                 ax.set_xlim(0, 100)
                 ax.set_xlabel("割合（％）")
                 if spec.legend:
-                    ax.legend(loc="upper center", bbox_to_anchor=(.5, -.22), ncol=min(3, len(table.columns)), frameon=False)
+                    ax.legend(loc="upper center", bbox_to_anchor=(.5, 0), bbox_transform=legend_transform, ncol=min(3, len(table.columns)), frameon=False)
             else:
                 height = .8 / max(len(table.index), 1)
+                bar_pitch = height if spec.group else 1.0
                 for i, g in enumerate(table.index):
                     pos = np.arange(len(table.columns)) + (i - (len(table.index) - 1) / 2) * height
                     values = table.loc[g].fillna(0).to_numpy(dtype=float)
@@ -210,12 +252,12 @@ def render(ds: Dataset, spec: FigureSpec):
                     if spec.show_values:
                         raw = table.loc[g].to_numpy(dtype=float)
                         labels = ["—" if not np.isfinite(v) else f"{v:.0f}" if spec.metric == "count" else f"{v:.1f}%" for v in raw]
-                        ax.bar_label(bars, labels=labels, padding=3, fontsize=max(6, spec.font_size - 1))
+                        annotations.extend(ax.bar_label(bars, labels=labels, padding=3, fontsize=spec.value_font_size))
                 ax.set_yticks(range(len(table.columns)), [label(c) for c in table.columns])
                 ax.set_xlabel("人数" if spec.metric == "count" else "割合（％）")
                 ax.margins(x=.2)
                 if spec.group and spec.legend:
-                    ax.legend(loc="upper center", bbox_to_anchor=(.5, -.18), ncol=min(3, len(table.index)), frameon=False)
+                    ax.legend(loc="upper center", bbox_to_anchor=(.5, 0), bbox_transform=legend_transform, ncol=min(3, len(table.index)), frameon=False)
             ax.invert_yaxis()
         if spec.chart != "heatmap":
             for spine in ["top", "right"]:
@@ -223,10 +265,13 @@ def render(ds: Dataset, spec: FigureSpec):
             ax.set_axisbelow(True)
             ax.grid(axis="y" if q.kind == "numeric" else "x", alpha=.2, visible=spec.grid)
         ax.set_title(label(spec.title or q.label), loc="left", pad=14, fontweight="bold")
-        fig.tight_layout(pad=spec.padding)
+        if spec.chart == "bar":
+            renderer = _fit_bar_height(fig, ax, canvas, spec, bar_pitch, annotations)
+        else:
+            fig.tight_layout(pad=spec.padding)
+            canvas.draw()
+            renderer = canvas.get_renderer()
         # Position below the entire axes/legend bounding box; exports use bbox_inches=tight.
-        fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
         boxes = [ax.get_tightbbox(renderer)]
         if ax.get_legend():
             boxes.append(ax.get_legend().get_window_extent(renderer))
@@ -238,12 +283,20 @@ def render(ds: Dataset, spec: FigureSpec):
         return fig
 
 
-def export_figure(fig, spec: FigureSpec, fmt: str) -> bytes:
+def export_figure(fig, spec: FigureSpec, fmt: str, *, dpi: int | None = None) -> bytes:
     if fmt not in ("png", "svg", "pdf"):
         raise SurveyError("対応していない出力形式です。")
     output = BytesIO()
-    with plt.rc_context({"pdf.fonttype": 42, "svg.fonttype": "none" if spec.svg_text else "path"}):
-        fig.savefig(output, format=fmt, dpi=int(spec.dpi), bbox_inches="tight", pad_inches=.15, transparent=spec.transparent, facecolor="none" if spec.transparent else spec.background)
+    resolution = int(spec.dpi if dpi is None else dpi)
+    with _DRAW_LOCK, plt.rc_context({"pdf.fonttype": 42, "svg.fonttype": "none" if spec.svg_text else "path"}):
+        if fmt == "png":
+            canvas = fig.canvas if isinstance(fig.canvas, FigureCanvasAgg) else FigureCanvasAgg(fig)
+            canvas.draw()
+            bbox = fig.get_tightbbox(canvas.get_renderer())
+            width, height = math.ceil((bbox.width + .3) * resolution), math.ceil((bbox.height + .3) * resolution)
+            if max(width, height) > MAX_PNG_SIDE or width * height > MAX_PNG_PIXELS:
+                raise SurveyError(f"PNGのサイズが大きすぎます（約{width}×{height}px）。dpi・幅・高さを下げるか、SVG/PDFで出力してください。")
+        fig.savefig(output, format=fmt, dpi=resolution, bbox_inches="tight", pad_inches=.15, transparent=spec.transparent, facecolor="none" if spec.transparent else spec.background)
     return output.getvalue()
 
 
@@ -263,7 +316,7 @@ def batch_export(ds: Dataset, specs: list[FigureSpec], formats=("png", "svg", "p
 
 def multipage_pdf(ds: Dataset, specs: list[FigureSpec]) -> bytes:
     output = BytesIO()
-    with plt.rc_context({"pdf.fonttype": 42}), PdfPages(output) as pages:
+    with _DRAW_LOCK, plt.rc_context({"pdf.fonttype": 42}), PdfPages(output) as pages:
         for spec in specs:
             fig = render(ds, spec)
             try:

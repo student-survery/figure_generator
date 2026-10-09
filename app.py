@@ -194,9 +194,11 @@ def editor(ds: Dataset):
             a, b = st.columns(2)
             spec.width = a.number_input("幅（cm）", 8.0, 60.0, float(old.width), .5, key="editor_width")
             spec.height = b.number_input("高さ（cm）", 6.0, 60.0, float(old.height), .5, key="editor_height")
+            spec.auto_height = st.checkbox("棒グラフの高さを自動調整", old.auto_height, key="editor_auto_height", help="指定した高さを最小値とし、カテゴリー・グループ数と文字の高さに応じて最大60cmまで広げます。")
             spec.dpi = st.number_input("PNG解像度（dpi）", 72, 600, int(old.dpi), 50, key="editor_dpi")
             spec.order = select("選択肢の並び順", ["definition", "descending", "ascending"], old.order, "editor_order", format_func=lambda o: {"definition": "設問定義順", "descending": "人数の多い順", "ascending": "人数の少ない順"}[o])
             spec.show_values = st.checkbox("値ラベル", old.show_values, key="editor_values")
+            spec.value_font_size = st.slider("値ラベルの文字サイズ（pt）", 6, 30, int(old.value_font_size), key="editor_value_font_size")
             spec.legend = st.checkbox("凡例", old.legend, key="editor_legend")
             spec.grid = st.checkbox("補助線", old.grid, key="editor_grid")
             spec.transparent = st.checkbox("背景を透明にする", old.transparent, key="editor_transparent")
@@ -242,11 +244,17 @@ def editor(ds: Dataset):
         try:
             result, note = data_for_spec(ds, spec)
             fig = render(ds, spec)
-            st.image(export_figure(fig, spec, "png"), width="stretch")
+            st.image(export_figure(fig, spec, "png", dpi=min(spec.dpi, 120)), width="stretch")
+            if fig.get_figheight() * 2.54 > spec.height + .05:
+                st.caption(f"ラベルの重なりを抑えるため、高さを {fig.get_figheight() * 2.54:.1f}cm に自動調整しています。")
             st.caption(note)
             buttons = st.columns(3)
             for column, fmt in zip(buttons, ("png", "svg", "pdf")):
-                column.download_button(fmt.upper(), export_figure(fig, spec, fmt), f"survey_No{q.number}.{fmt}", mime={"png": "image/png", "svg": "image/svg+xml", "pdf": "application/pdf"}[fmt], width="stretch")
+                try:
+                    output = export_figure(fig, spec, fmt)
+                    column.download_button(fmt.upper(), output, f"survey_No{q.number}.{fmt}", mime={"png": "image/png", "svg": "image/svg+xml", "pdf": "application/pdf"}[fmt], width="stretch")
+                except SurveyError as exc:
+                    column.warning(str(exc))
             if q.kind == "numeric":
                 st.dataframe(result.describe().rename("値"), width="stretch")
             else:
@@ -258,7 +266,9 @@ def editor(ds: Dataset):
                     st.write("割合の分母（人数）")
                     st.dataframe(result.denominators.astype(int), width="stretch")
             st.session_state.active_spec = spec
-        except (SurveyError, ValueError, TypeError, KeyError, StopIteration):
+        except SurveyError as exc:
+            st.error(str(exc))
+        except (ValueError, TypeError, KeyError, StopIteration):
             st.error("この条件で図を作成できません。設問・フィルター・色・フォントの設定を確認してください。")
         finally:
             if fig is not None:
