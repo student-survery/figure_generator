@@ -6,4 +6,4 @@ exports/
 tests/artifacts/
 .test-tmp/
 .wheels/
-.docx
+*.docx
