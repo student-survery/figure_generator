@@ -61,7 +61,7 @@ def excel_bytes(path: str, password: str = "") -> BytesIO:
         raise SurveyError("復号できません。パスワード、Excel形式、ファイルの破損を確認してください。") from None
 
 
-def _xml_sheets(buffer: BytesIO) -> dict[str, pd.DataFrame]:
+def _xml_sheets(buffer: BytesIO, preserve_blank_rows=False, end_row=None) -> dict[str, pd.DataFrame]:
     """Read cached OOXML values when openpyxl is unavailable (sample inspection)."""
     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     rns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -75,7 +75,19 @@ def _xml_sheets(buffer: BytesIO) -> dict[str, pd.DataFrame]:
             target = rels[sheet.get(f"{{{rns}}}id")]
             target = target.lstrip("/") if target.startswith("/") else "xl/" + target
             cells, max_row, max_col = {}, 0, 0
-            for row in ET.fromstring(archive.read(target)).findall("m:sheetData/m:row", ns):
+            worksheet = ET.fromstring(archive.read(target))
+            if preserve_blank_rows:
+                dimension = worksheet.find("m:dimension", ns)
+                if dimension is not None:
+                    match = re.search(r"(\d+)$", dimension.get("ref", ""))
+                    if match:
+                        max_row = int(match[1])
+            for row in worksheet.findall("m:sheetData/m:row", ns):
+                row_number = int(row.get("r", "0"))
+                if preserve_blank_rows:
+                    max_row = max(max_row, row_number)
+                if end_row is not None and row_number > end_row:
+                    continue
                 for cell in row.findall("m:c", ns):
                     value = cell.find("m:v", ns)
                     if cell.get("t") == "inlineStr":
@@ -92,18 +104,43 @@ def _xml_sheets(buffer: BytesIO) -> dict[str, pd.DataFrame]:
                     index = (int(match[2]) - 1, col - 1)
                     cells[index] = v
                     max_row, max_col = max(max_row, index[0] + 1), max(max_col, col)
-            frame = pd.DataFrame([[cells.get((r, c), None) for c in range(max_col)] for r in range(max_row)])
+            if end_row is not None:
+                max_row = end_row
+            frame = pd.DataFrame([[cells.get((r, c), None) for c in range(max_col)] for r in range(max_row)], dtype=object)
             result[sheet.get("name")] = frame
         return result
 
 
-def read_sheets(path: str, password: str = "") -> dict[str, pd.DataFrame]:
+def read_sheets(path: str, password: str = "", *, preserve_blank_rows=False, end_row=None) -> dict[str, pd.DataFrame]:
+    if end_row is not None and (isinstance(end_row, bool) or not isinstance(end_row, int) or not 2 <= end_row <= 1_048_576):
+        raise SurveyError("回答の最終行は2～1048576の整数で指定してください。")
     buffer = excel_bytes(path, password)
     try:
         try:
-            import openpyxl  # noqa: F401
+            import openpyxl
         except ImportError:
-            return _xml_sheets(buffer)
+            return _xml_sheets(buffer, preserve_blank_rows, end_row)
+        if preserve_blank_rows:
+            # pandas.read_excel trims trailing blank rows. Keep the worksheet's
+            # saved row extent (or the explicit response end row) for answers.
+            workbook = openpyxl.load_workbook(buffer, read_only=True, data_only=True, keep_links=False)
+            try:
+                result = {}
+                for sheet in workbook.worksheets:
+                    last_row = end_row if end_row is not None else sheet.max_row
+                    frame = pd.DataFrame(
+                        [[None if cell.data_type == "e" else cell.value for cell in row]
+                         for row in sheet.iter_rows(max_row=last_row)],
+                        dtype=object,
+                    )
+                    # The read-only iterator may stop at the final XML row,
+                    # even when the saved/explicit extent continues beyond it.
+                    if last_row is not None:
+                        frame = frame.reindex(index=range(last_row))
+                    result[sheet.title] = frame
+                return result
+            finally:
+                workbook.close()
         return pd.read_excel(buffer, sheet_name=None, header=None, dtype=object, engine="openpyxl", keep_default_na=False)
     except Exception:
         raise SurveyError("Excelの内容を読み込めません。対応する .xlsx または .xlsm ファイルか確認してください。") from None
@@ -253,8 +290,7 @@ def fingerprint(questions: list[Question], frame: pd.DataFrame):
 
 def build_dataset(questions: list[Question], frame: pd.DataFrame, aliases: dict | None = None) -> Dataset:
     answers = frame.iloc[2:].copy().reset_index(drop=True)
-    # Only remove wholly blank rows, preserving every nonblank respondent.
-    answers = answers.loc[answers.apply(lambda row: any(text(v) for v in row), axis=1)].reset_index(drop=True)
+    # Every response row counts as a respondent, including wholly blank rows.
     values, problems = {}, {}
     aliases = aliases or {}
     for q in questions:
@@ -324,6 +360,52 @@ def membership(ds: Dataset, qid: str, include_missing=False) -> pd.DataFrame:
     return result
 
 
+def validate_merges(question: Question, merges: dict):
+    if not isinstance(merges, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in merges.items()):
+        raise SurveyError("選択肢の集約設定の形式が不正です。")
+    if merges and question.kind not in ("single", "multi"):
+        raise SurveyError("選択肢の集約は選択式設問で使用できます。")
+    if any(choice not in question.choices for choice in merges):
+        raise SurveyError("集約元の選択肢が現在の設問にありません。")
+    if any(not name.strip() for name in merges.values()):
+        raise SurveyError("集約後の区分名を空欄にすることはできません。")
+    if any(norm(name) == norm(MISSING) for name in merges.values()):
+        raise SurveyError("無回答の区分名は集約先に指定できません。")
+
+
+def merged_choices(question: Question, merges: dict) -> list[str]:
+    validate_merges(question, merges)
+    return list(dict.fromkeys(merges.get(choice, choice).strip() for choice in question.choices))
+
+
+def merged_membership(ds: Dataset, qid: str, merges: dict, include_missing=False) -> pd.DataFrame:
+    question = ds.question(qid)
+    validate_merges(question, merges)
+    members = membership(ds, qid)
+    result = pd.DataFrame(index=members.index)
+    for choice in members:
+        name = merges.get(choice, choice).strip()
+        if name in result:
+            # OR, not addition: each respondent counts once in a merged category.
+            result[name] |= members[choice]
+        else:
+            result[name] = members[choice].copy()
+    if include_missing:
+        result[MISSING] = ~members.any(axis=1)
+    return result
+
+
+def merge_note(question: Question, merges: dict, role: str) -> str:
+    if not merges:
+        return ""
+    groups = {}
+    for choice in question.choices:
+        groups.setdefault(merges.get(choice, choice).strip(), []).append(choice)
+    changes = [f"{name} ← {' / '.join(choices)}" for name, choices in groups.items()
+               if len(choices) > 1 or choices[0] != name]
+    return f" {role}の集約：{'；'.join(changes)}。" if changes else ""
+
+
 def filter_index(ds: Dataset, filters: list[dict]) -> pd.Index:
     if not isinstance(filters, list):
         raise SurveyError("絞り込み条件の形式が不正です。")
@@ -359,10 +441,16 @@ class Aggregate:
     filtered_n: int
 
 
-def aggregate(ds: Dataset, qid: str, group_id: str | None = None, filters: list[dict] | None = None, denominator="valid", include_missing=False, percent_mode="row") -> Aggregate:
+def aggregate(ds: Dataset, qid: str, group_id: str | None = None, filters: list[dict] | None = None, denominator="valid", include_missing=False, percent_mode="row", *, question_merges=None, group_merges=None) -> Aggregate:
+    question_merges = {} if question_merges is None else question_merges
+    group_merges = {} if group_merges is None else group_merges
+    if not isinstance(group_merges, dict):
+        raise SurveyError("属性側の集約設定の形式が不正です。")
+    if group_id is None and group_merges:
+        raise SurveyError("属性側の集約には属性の設問を指定してください。")
     idx = filter_index(ds, filters or [])
-    target = membership(ds, qid, include_missing).loc[idx]
-    group = membership(ds, group_id, include_missing).loc[idx] if group_id else pd.DataFrame({"全体": True}, index=idx)
+    target = merged_membership(ds, qid, question_merges, include_missing).loc[idx]
+    group = merged_membership(ds, group_id, group_merges, include_missing).loc[idx] if group_id else pd.DataFrame({"全体": True}, index=idx)
     counts = pd.DataFrame(group.to_numpy(dtype=int).T @ target.to_numpy(dtype=int), index=group.columns, columns=target.columns)
     valid_target, valid_group = target.any(axis=1), group.any(axis=1)
     den = pd.DataFrame(0.0, index=counts.index, columns=counts.columns)
@@ -388,6 +476,9 @@ def aggregate(ds: Dataset, qid: str, group_id: str | None = None, filters: list[
         note += "無回答はカテゴリーから除外。"
     if multi:
         note += "複数選択は回答者単位で計数し、合計が100％を超える場合があります。全列空欄は無回答扱い。"
-    if group_id and ds.question(group_id).kind == "multi":
+    if group_id and ds.question(group_id).kind == "multi" and (group.sum(axis=1) > 1).any():
         note += "グループ間に回答者の重複があります。"
+    note += merge_note(ds.question(qid), question_merges, "回答側")
+    if group_id:
+        note += merge_note(ds.question(group_id), group_merges, "属性側")
     return Aggregate(counts, percents, den, note, len(idx))

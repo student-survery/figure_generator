@@ -19,7 +19,7 @@ from matplotlib.transforms import ScaledTranslation
 import numpy as np
 import pandas as pd
 
-from .core import Dataset, SurveyError, aggregate, filter_index, MISSING
+from .core import Dataset, SurveyError, aggregate, filter_index, MISSING, validate_merges
 
 
 _DRAW_LOCK = RLock()
@@ -79,6 +79,8 @@ class FigureSpec:
     svg_text: bool = False
     auto_height: bool = True
     value_font_size: float = 9
+    question_merges: dict[str, str] = field(default_factory=dict)
+    group_merges: dict[str, str] = field(default_factory=dict)
 
 
 def validate_spec(spec: FigureSpec, ds: Dataset):
@@ -96,6 +98,13 @@ def validate_spec(spec: FigureSpec, ds: Dataset):
     if spec.question not in available or (spec.group and spec.group not in available):
         raise SurveyError("図に指定された設問は現在のデータでは使用できません。")
     q = available[spec.question]
+    validate_merges(q, spec.question_merges)
+    if not isinstance(spec.group_merges, dict):
+        raise SurveyError("属性側の集約設定の形式が不正です。")
+    if spec.group:
+        validate_merges(available[spec.group], spec.group_merges)
+    elif spec.group_merges:
+        raise SurveyError("属性側の集約には属性の設問を指定してください。")
     if spec.mode not in ("single", "attribute", "cross") or spec.chart not in ("bar", "stacked", "heatmap", "histogram"):
         raise SurveyError("図の形式が不正です。")
     if (spec.mode == "single" and spec.group) or (spec.mode != "single" and not spec.group):
@@ -139,7 +148,8 @@ def data_for_spec(ds: Dataset, spec: FigureSpec):
         idx = filter_index(ds, spec.filters)
         series = ds.values[spec.question].loc[idx].dropna()
         return series, f"対象者数 N={len(idx)}、有効回答 n={len(series)}、無回答 {len(idx) - len(series)}。" + filter_note(ds, spec)
-    result = aggregate(ds, spec.question, spec.group, spec.filters, spec.denominator, spec.include_missing, spec.percent_mode)
+    result = aggregate(ds, spec.question, spec.group, spec.filters, spec.denominator, spec.include_missing, spec.percent_mode,
+                       question_merges=spec.question_merges, group_merges=spec.group_merges)
     note = result.note + filter_note(ds, spec)
     den = result.denominators
     if spec.percent_mode == "row":

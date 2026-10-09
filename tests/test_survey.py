@@ -6,14 +6,16 @@ import json
 import unittest
 import zipfile
 from uuid import uuid4
+from unittest.mock import patch
 
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from survey.core import (Question, SurveyError, read_sheets, definitions, map_questions,
-                         build_dataset, aggregate, filter_index, membership)
-from survey.charts import (FigureSpec, render, export_figure, batch_export,
+                         build_dataset, aggregate, filter_index, membership, _xml_sheets,
+                         merged_choices, MISSING)
+from survey.charts import (FigureSpec, render, export_figure, batch_export, data_for_spec,
                            multipage_pdf, save_settings, load_settings, validate_spec,
                            default_font)
 
@@ -62,6 +64,61 @@ def dense_fixture():
 
 
 class CoreTests(unittest.TestCase):
+    def test_single_merges_into_existing_choice_and_keeps_missing(self):
+        ds, _ = fixture()
+        result = aggregate(ds, "1", question_merges={"A": "B"}, include_missing=True)
+        self.assertEqual(result.counts.columns.tolist(), ["B", MISSING])
+        self.assertEqual(result.counts.iloc[0].tolist(), [3, 2])
+        self.assertEqual(result.percents.iloc[0].tolist(), [60, 40])
+        self.assertEqual(result.filtered_n, 5)
+        self.assertIn("B ← A / B", result.note)
+        self.assertEqual(aggregate(ds, "1", question_merges={"A": "B"}).denominators.iloc[0, 0], 3)
+
+    def test_multi_merges_deduplicate_respondents_on_both_axes(self):
+        ds, _ = marked_fixture()
+        before = ds.values["2"].copy(deep=True)
+        question = {"X": "合計", "Y": "合計"}
+        groups = {"M": "全属性", "N": "全属性"}
+        result = aggregate(ds, "2", "5", question_merges=question, group_merges=groups)
+        self.assertEqual(result.counts.values.tolist(), [[3]])
+        self.assertEqual(result.denominators.values.tolist(), [[3]])
+        self.assertEqual(result.percents.values.tolist(), [[100]])
+        all_people = aggregate(ds, "2", "5", denominator="all", question_merges=question, group_merges=groups)
+        self.assertEqual(all_people.denominators.values.tolist(), [[4]])
+        self.assertEqual(all_people.percents.values.tolist(), [[75]])
+        self.assertIn("回答側の集約", result.note)
+        self.assertIn("属性側の集約", result.note)
+        self.assertNotIn("グループ間に回答者の重複があります", result.note)
+        pd.testing.assert_frame_equal(ds.values["2"], before)
+
+    def test_merge_filters_use_original_choices_and_denominators(self):
+        ds, _ = fixture()
+        result = aggregate(ds, "2", filters=[{"question": "2", "choices": ["X"]}],
+                           question_merges={"X": "まとめ", "Y": "まとめ"})
+        self.assertEqual(result.filtered_n, 2)
+        self.assertEqual(result.counts.iloc[0, 0], 2)
+        self.assertEqual(result.denominators.iloc[0, 0], 2)
+        for direction in ["row", "column", "overall"]:
+            result = aggregate(ds, "1", "3", percent_mode=direction,
+                               question_merges={"A": "全回答", "B": "全回答"},
+                               group_merges={"G1": "全属性", "G2": "全属性"})
+            self.assertEqual(result.counts.values.tolist(), [[3]])
+            self.assertEqual(result.denominators.values.tolist(), [[3]])
+            self.assertEqual(result.percents.values.tolist(), [[100]])
+
+    def test_merge_order_and_invalid_mappings(self):
+        ds, _ = fixture()
+        self.assertEqual(merged_choices(ds.question("1"), {"B": "A"}), ["A"])
+        self.assertEqual(merged_choices(ds.question("1"), {"A": "新しい名前"}), ["新しい名前", "B"])
+        for mapping in [{"A": ""}, {"A": "   "}, {"A": MISSING},
+                        {"missing": "その他"}, {"A": None}, []]:
+            with self.assertRaises(SurveyError):
+                aggregate(ds, "1", question_merges=mapping)
+        with self.assertRaises(SurveyError):
+            validate_spec(FigureSpec("4", chart="histogram", question_merges={"0": "まとめ"}), ds)
+        with self.assertRaises(SurveyError):
+            validate_spec(FigureSpec("1", group_merges={"G1": "まとめ"}), ds)
+
     def test_supplied_structure(self):
         defs = next(iter(read_sheets(str(ROOT / "question_explanation.xlsx")).values()))
         frame = next(iter(read_sheets(str(ROOT / "sample.xlsx")).values()))
@@ -79,10 +136,11 @@ class CoreTests(unittest.TestCase):
         result = aggregate(ds, "1")
         self.assertEqual(result.counts.loc["全体"].tolist(), [2, 1])
         self.assertAlmostEqual(result.percents.loc["全体", "A"], 200 / 3)
-        self.assertEqual(aggregate(ds, "1", denominator="all").percents.loc["全体", "A"], 50)
+        self.assertEqual(len(ds.index), 5)
+        self.assertEqual(aggregate(ds, "1", denominator="all").percents.loc["全体", "A"], 40)
         missing = aggregate(ds, "1", include_missing=True)
-        self.assertEqual(missing.counts.iloc[0].sum(), 4)
-        self.assertEqual(missing.denominators.iloc[0, 0], 4)
+        self.assertEqual(missing.counts.iloc[0].sum(), 5)
+        self.assertEqual(missing.denominators.iloc[0, 0], 5)
 
     def test_multi_respondent_denominator(self):
         ds, _ = fixture()
@@ -90,7 +148,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.counts.iloc[0].tolist(), [2, 2])
         self.assertEqual(result.denominators.iloc[0].tolist(), [3, 3])
         self.assertAlmostEqual(result.percents.iloc[0].sum(), 400 / 3)
-        self.assertEqual(aggregate(ds, "2", denominator="all").percents.iloc[0].tolist(), [50, 50])
+        self.assertEqual(aggregate(ds, "2", denominator="all").percents.iloc[0].tolist(), [40, 40])
 
     def test_circle_answers_use_header_choices_and_valid_denominator(self):
         legacy, _ = fixture()
@@ -103,10 +161,50 @@ class CoreTests(unittest.TestCase):
             pd.testing.assert_frame_equal(result.counts, aggregate(legacy, qid).counts)
             pd.testing.assert_frame_equal(result.percents, aggregate(legacy, qid).percents)
         self.assertEqual(aggregate(ds, "2").denominators.iloc[0].tolist(), [3, 3])
-        self.assertEqual(aggregate(ds, "2", denominator="all").percents.iloc[0].tolist(), [50, 50])
+        self.assertEqual(aggregate(ds, "2", denominator="all").percents.iloc[0].tolist(), [40, 40])
         missing = aggregate(ds, "2", include_missing=True)
-        self.assertEqual(missing.counts.iloc[0].tolist(), [2, 2, 1])
-        self.assertEqual(missing.denominators.iloc[0, 0], 4)
+        self.assertEqual(missing.counts.iloc[0].tolist(), [2, 2, 2])
+        self.assertEqual(missing.denominators.iloc[0, 0], 5)
+
+    def test_fully_blank_and_whitespace_responses_are_retained(self):
+        ds, frame = fixture()
+        frame.loc[3] = [None] * frame.shape[1]
+        frame.loc[4] = [" \t　"] * frame.shape[1]
+        rebuilt = build_dataset(ds.questions, frame)
+        self.assertEqual(len(rebuilt.index), 5)
+        self.assertEqual(rebuilt.values["1"].tolist(), ["A", "", "", "A", ""])
+        self.assertEqual(aggregate(rebuilt, "1", denominator="all").denominators.iloc[0, 0], 5)
+        self.assertEqual(aggregate(rebuilt, "1", include_missing=True).counts.iloc[0, -1], 3)
+
+    @unittest.skipUnless(importlib.util.find_spec("openpyxl"), "openpyxlが未インストール")
+    def test_1607_responses_including_middle_and_trailing_blank_rows(self):
+        from openpyxl import Workbook
+        workbook = Workbook()
+        workbook.active.append(["No.1：単一"])
+        workbook.active.append([None])
+        for row in range(3, 1610):
+            workbook.active.append([None if row in {5, 27, 1608, 1609} else "A"])
+        buffer = BytesIO()
+        workbook.save(buffer)
+        raw = buffer.getvalue()
+        for end_row in [None, 1609]:
+            with patch("survey.core.Path.read_bytes", return_value=raw):
+                frame = next(iter(read_sheets("synthetic.xlsx", preserve_blank_rows=True, end_row=end_row).values()))
+            q = Question("q", "単一", "single", ["A"])
+            map_questions([q], frame)
+            ds = build_dataset([q], frame)
+            self.assertEqual(len(frame), 1609)
+            self.assertEqual(len(ds.index), 1607)
+            self.assertEqual(aggregate(ds, "q", denominator="all").denominators.iloc[0, 0], 1607)
+            self.assertEqual(aggregate(ds, "q").counts.iloc[0, 0], 1603)
+            self.assertEqual(aggregate(ds, "q", include_missing=True).counts.iloc[0, -1], 4)
+        fallback = next(iter(_xml_sheets(BytesIO(raw), preserve_blank_rows=True).values()))
+        self.assertEqual(len(fallback), 1609)
+        fallback_bound = next(iter(_xml_sheets(BytesIO(raw), preserve_blank_rows=True, end_row=1607).values()))
+        self.assertEqual(len(fallback_bound), 1607)
+        with patch("survey.core.Path.read_bytes", return_value=raw):
+            bound = next(iter(read_sheets("synthetic.xlsx", preserve_blank_rows=True, end_row=1607).values()))
+        self.assertEqual(len(bound), 1607)
 
     def test_circle_answers_attribute_cross_and_filters(self):
         ds, _ = marked_fixture()
@@ -221,6 +319,49 @@ class CoreTests(unittest.TestCase):
 
 
 class ExportTests(unittest.TestCase):
+    def test_merged_figures_settings_and_all_exports(self):
+        ds, _ = fixture()
+        spec = FigureSpec("1", group="3", mode="cross", chart="heatmap", dpi=72,
+                          question_merges={"A": "全回答", "B": "全回答"},
+                          group_merges={"G1": "全属性", "G2": "全属性"},
+                          labels={"全回答": "回答の合計"}, colors={"全回答": "#0072B2"},
+                          font=default_font())
+        loaded, _, _ = load_settings(save_settings(ds, [spec], {}, {}), ds)
+        self.assertEqual(asdict(spec), asdict(loaded[0]))
+        result, note = data_for_spec(ds, loaded[0])
+        self.assertEqual(result.counts.columns.tolist(), ["全回答"])
+        self.assertEqual(result.counts.index.tolist(), ["全属性"])
+        self.assertIn("回答側の集約", note)
+        for chart in ["bar", "heatmap", "stacked"]:
+            spec.chart = chart
+            fig = render(ds, spec)
+            try:
+                tick_labels = [tick.get_text() for tick in fig.axes[0].get_yticklabels()]
+                self.assertIn("回答の合計" if chart == "bar" else "全属性", tick_labels)
+                for fmt in ["png", "svg", "pdf"]:
+                    self.assertTrue(export_figure(fig, spec, fmt))
+            finally:
+                plt.close(fig)
+        with zipfile.ZipFile(BytesIO(batch_export(ds, [spec]))) as archive:
+            self.assertEqual(len(archive.namelist()), 3)
+        self.assertTrue(multipage_pdf(ds, [spec]).startswith(b"%PDF"))
+
+    def test_merged_sorting_and_old_settings_compatibility(self):
+        ds, _ = fixture()
+        spec = FigureSpec("1", question_merges={"B": "少数回答"}, order="ascending", font=default_font())
+        fig = render(ds, spec)
+        try:
+            self.assertEqual([tick.get_text() for tick in fig.axes[0].get_yticklabels()], ["少数回答", "A"])
+        finally:
+            plt.close(fig)
+        payload = json.loads(save_settings(ds, [spec], {}, {}))
+        payload["figures"][0].pop("question_merges")
+        payload["figures"][0].pop("group_merges")
+        loaded, _, _ = load_settings(json.dumps(payload).encode(), ds)
+        self.assertEqual(loaded[0].question_merges, {})
+        self.assertEqual(loaded[0].group_merges, {})
+        validate_spec(loaded[0], ds)
+
     def test_render_uses_agg_even_with_base_canvas_backend(self):
         previous = plt.get_backend()
         plt.switch_backend("template")
@@ -397,9 +538,10 @@ class ExportTests(unittest.TestCase):
         try:
             path.write_bytes(encrypted.getvalue())
             before = path.read_bytes()
-            loaded = next(iter(read_sheets(str(path), "test-password").values()))
+            loaded = next(iter(read_sheets(str(path), "test-password", preserve_blank_rows=True).values()))
             decrypted = build_dataset(ds.questions, loaded)
             self.assertFalse(decrypted.problems)
+            self.assertEqual(len(decrypted.index), 5)
             self.assertEqual(aggregate(decrypted, "2").counts.iloc[0].tolist(), [2, 2])
             with self.assertRaises(SurveyError):
                 read_sheets(str(path), "wrong")
@@ -411,6 +553,50 @@ class ExportTests(unittest.TestCase):
 
 
 class AppTests(unittest.TestCase):
+    def test_merge_tables_restore_edit_reset_and_question_switch(self):
+        from streamlit.testing.v1 import AppTest
+        ds, frame = fixture()
+        definitions_frame = pd.DataFrame(
+            [["No", "質問内容", "回答方式", "選択肢"]]
+            + [[q.id, q.title, {"single": "選択", "multi": "複数選択", "numeric": "整数入力"}[q.kind], "\n".join(q.choices)] for q in ds.questions]
+        )
+        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=40)
+        app.session_state.sheets = ({"定義": definitions_frame}, {"回答": frame})
+        app.run()
+        self.assertFalse(app.exception)
+        spec = FigureSpec("1", group="5", mode="cross", font=default_font(),
+                          question_merges={"A": "まとめ", "B": "まとめ"},
+                          group_merges={"M": "全属性", "N": "全属性"})
+        app.session_state.figures = [spec]
+        app.run()
+        next(b for b in app.button if b.label == "編集").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state.active_spec.question_merges, spec.question_merges)
+        self.assertEqual(app.session_state.active_spec.group_merges, spec.group_merges)
+        tables = [table.value for table in app.dataframe]
+        self.assertTrue(any(list(table.columns) == ["元の選択肢", "集約後の区分名"] and table["集約後の区分名"].tolist() == ["まとめ", "まとめ"] for table in tables))
+        next(b for b in app.button if b.label == "回答側を元に戻す").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state.active_spec.question_merges, {})
+        self.assertEqual(app.session_state.active_spec.group_merges, spec.group_merges)
+        self.assertEqual(app.session_state.figures[0].question_merges, spec.question_merges)
+        app.session_state["editor_merges_question_1"] = {
+            "edited_rows": {0: {"集約後の区分名": "新区分"}, 1: {"集約後の区分名": "新区分"}},
+            "added_rows": [], "deleted_rows": [],
+        }
+        app.run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state.active_spec.question_merges, {"A": "新区分", "B": "新区分"})
+        app.run()
+        self.assertEqual(app.session_state.active_spec.question_merges, {"A": "新区分", "B": "新区分"})
+        next(s for s in app.selectbox if s.label == "表示する設問").select("2").run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state.active_spec.question_merges, {})
+        self.assertEqual(app.session_state.active_spec.group_merges, spec.group_merges)
+        next(b for b in app.button if b.label == "属性側を元に戻す").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state.active_spec.group_merges, {})
+
     def test_start_and_sample_load(self):
         from streamlit.testing.v1 import AppTest
         app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30).run()
@@ -420,6 +606,10 @@ class AppTests(unittest.TestCase):
         self.assertEqual(len(app.session_state.dataset.questions), 128)
         self.assertEqual(len(app.session_state.dataset.index), 0)
         self.assertEqual(app.session_state.answer_password, "")
+        next(n for n in app.number_input if n.label == "回答の最終行（0で自動）").set_value(1609)
+        next(b for b in app.button if b.label == "読み込む / 再読込").click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(len(app.session_state.dataset.index), 1607)
         next(b for b in app.button if b.label == "データと設定をクリア").click().run()
         self.assertFalse(app.exception)
         self.assertNotIn("sheets", app.session_state)

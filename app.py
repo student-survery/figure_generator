@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 import copy
+import hashlib
+import json
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
 from survey.core import (Dataset, SurveyError, definitions, read_sheets, map_questions,
-                         build_dataset, header_groups, MISSING)
+                         build_dataset, header_groups, MISSING, merged_choices, text)
 from survey.charts import (FigureSpec, PALETTES, fonts, default_font, data_for_spec,
                            render, export_figure, batch_export, multipage_pdf,
                            save_settings, load_settings, validate_spec)
@@ -31,7 +33,8 @@ def load_files():
     st.session_state.pop("answer_sheet", None)
     try:
         q = read_sheets(st.session_state["definition_path"], st.session_state.get("definition_password", ""))
-        a = read_sheets(st.session_state["answer_path"], st.session_state.get("answer_password", ""))
+        a = read_sheets(st.session_state["answer_path"], st.session_state.get("answer_password", ""),
+                        preserve_blank_rows=True, end_row=st.session_state.get("answer_end_row", 0) or None)
         st.session_state.sheets = (q, a)
         st.session_state.pop("load_error", None)
     except SurveyError as exc:
@@ -43,7 +46,7 @@ def load_files():
 
 def clear_files():
     clear_results()
-    for key in ["sheets", "load_error", "definition_password", "answer_password", "definition_path", "answer_path", "definition_sheet", "answer_sheet"]:
+    for key in ["sheets", "load_error", "definition_password", "answer_password", "definition_path", "answer_path", "definition_sheet", "answer_sheet", "answer_end_row"]:
         st.session_state.pop(key, None)
 
 
@@ -120,6 +123,28 @@ def select(label, options, default, key, **kwargs):
     return st.selectbox(label, options, index=options.index(default) if default in options else 0, key=key, **kwargs)
 
 
+def reset_merges(role):
+    old = st.session_state.get("active_spec")
+    if old:
+        spec = copy.deepcopy(old)
+        setattr(spec, f"{role}_merges", {})
+        st.session_state.active_spec = spec
+    for key in list(st.session_state):
+        if key.startswith(f"editor_merges_{role}_"):
+            del st.session_state[key]
+
+
+def merge_editor(question, role, mapping):
+    st.write("回答側" if role == "question" else "属性側")
+    rows = [{"元の選択肢": choice, "集約後の区分名": mapping.get(choice, choice)} for choice in question.choices]
+    edited = st.data_editor(pd.DataFrame(rows), hide_index=True, disabled=["元の選択肢"],
+                           num_rows="fixed", key=f"editor_merges_{role}_{question.id}", width="stretch")
+    st.button("回答側を元に戻す" if role == "question" else "属性側を元に戻す",
+              key=f"editor_reset_merges_{role}", on_click=reset_merges, args=(role,))
+    return {row["元の選択肢"]: text(row["集約後の区分名"]) for _, row in edited.iterrows()
+            if text(row["集約後の区分名"]) != row["元の選択肢"]}
+
+
 def editor(ds: Dataset):
     available = ds.available()
     if not available or len(ds.index) == 0:
@@ -151,6 +176,32 @@ def editor(ds: Dataset):
             group_id = select("属性 / クロス集計の行設問", group_ids, old.group, "editor_group", format_func=qlabel)
         spec = copy.deepcopy(old)
         spec.question, spec.group, spec.mode = qid, group_id, mode
+        if qid != old.question or q.kind == "numeric":
+            spec.question_merges = {}
+        if group_id != old.group or group_id is None:
+            spec.group_merges = {}
+        previous = st.session_state.get("editor_merge_ids", (None, None))
+        for role, current, before in zip(("question", "group"), (qid, group_id), previous):
+            if current != before:
+                for key in list(st.session_state):
+                    if key.startswith(f"editor_merges_{role}_"):
+                        del st.session_state[key]
+        st.session_state.editor_merge_ids = (qid, group_id)
+        if q.kind != "numeric":
+            with st.expander("選択肢をまとめる"):
+                st.caption("同じ区分名に変更した選択肢をまとめます。例：2017年以前と2018年を、どちらも2018年以前に変更。")
+                spec.question_merges = merge_editor(q, "question", spec.question_merges)
+                if group_id:
+                    spec.group_merges = merge_editor(ds.question(group_id), "group", spec.group_merges)
+                st.caption("複数選択は同じ回答者を重複計数しません。無回答は独立した区分です。絞り込みは元の選択肢に対して適用します。")
+            try:
+                answer_labels = merged_choices(q, spec.question_merges)
+                group_labels = merged_choices(ds.question(group_id), spec.group_merges) if group_id else []
+            except SurveyError as exc:
+                st.error(str(exc))
+                return
+        else:
+            answer_labels, group_labels = [q.title], []
         filter_ids = st.multiselect("絞り込みに使う設問", ids, default=[f["question"] for f in old.filters if f["question"] in ids], format_func=qlabel, key="filter_ids")
         spec.filters = []
         for fid in filter_ids:
@@ -206,14 +257,15 @@ def editor(ds: Dataset):
             spec.wrap = st.slider("ラベルの折り返し文字数", 8, 60, int(old.wrap), key="editor_wrap")
             spec.padding = st.slider("図の余白", .2, 4.0, float(old.padding), .1, key="editor_padding")
             spec.svg_text = st.checkbox("SVGの文字をテキストとして残す", old.svg_text, key="editor_svg_text", help="標準はパス化です。テキストを残す場合、閲覧先でも同じフォントが必要です。")
-        labels = list(dict.fromkeys(q.choices + ([MISSING] if spec.include_missing else []) + (ds.question(group_id).choices if group_id else []))) if q.kind != "numeric" else [q.title]
+        labels = list(dict.fromkeys(answer_labels + ([MISSING] if spec.include_missing and q.kind != "numeric" else []) + group_labels))
         with st.expander("選択肢の色・表示名"):
             rows = []
             palette = PALETTES[spec.palette]
             for i, c in enumerate(labels):
                 rows.append({"元のラベル": c, "表示名": old.labels.get(c, c), "色": old.colors.get(c, palette[i % len(palette)])})
             # Recreate on question/palette changes, preserving saved figure defaults.
-            revision_key = f"editor_labels_{qid}_{group_id}_{spec.palette}_{spec.include_missing}"
+            label_hash = hashlib.sha256(json.dumps(labels, ensure_ascii=False).encode()).hexdigest()[:12]
+            revision_key = f"editor_labels_{qid}_{group_id}_{spec.palette}_{spec.include_missing}_{label_hash}"
             edited = st.data_editor(pd.DataFrame(rows), hide_index=True, disabled=["元のラベル"], key=revision_key, width="stretch")
             spec.labels = {r["元のラベル"]: str(r["表示名"]) for _, r in edited.iterrows() if str(r["表示名"]) != r["元のラベル"]}
             spec.colors = {r["元のラベル"]: str(r["色"]) for i, r in edited.iterrows() if str(r["色"]).upper() != palette[i % len(palette)].upper()}
@@ -284,6 +336,8 @@ with st.sidebar:
         st.text_input("設問定義のパスワード（必要な場合）", type="password", key="definition_password")
         st.text_input("回答ファイルのパス", value=str(ROOT / "sample.xlsx"), key="answer_path")
         st.text_input("回答ファイルのパスワード", type="password", key="answer_password")
+        st.number_input("回答の最終行（0で自動）", min_value=0, max_value=1_048_576, value=0, step=1,
+                        key="answer_end_row", help="全列が空欄の回答も数えます。0はシートに保存された最終行まで。書式だけの行が続く場合は回答の最終行を指定してください。例：1609を指定すると3～1609行の1607件です。")
         st.form_submit_button("読み込む / 再読込", on_click=load_files, type="primary", width="stretch")
     st.button("データと設定をクリア", on_click=clear_files, width="stretch")
     st.caption("元Excelは読み取り専用。パスワードは読み込み後に消去します。終了時は起動したターミナルで Ctrl+C。")
@@ -315,6 +369,7 @@ with data_tab:
     a.metric("回答者数", len(ds.index))
     b.metric("設問数", len(ds.questions))
     c.metric("確認が必要な設問", sum(bool(q.issue or q.id in ds.problems) for q in ds.questions))
+    st.caption("回答者数は先頭2行を除く全回答行の数です。全列空欄の回答も含みます。")
     if len(ds.index) == 0:
         st.info("回答行がありません。sample.xlsx は2行のヘッダーだけの形式見本です。実データのパスを指定してください。")
     rows = [{"回答No.": q.number, "設問": (q.parent + " / " if q.parent else "") + q.title, "形式": {"single": "単一選択", "multi": "複数選択", "numeric": "数値", "text": "自由記述"}[q.kind], "状態": q.issue or ("回答値の確認が必要" if q.id in ds.problems else "対応済み")} for q in ds.questions]
