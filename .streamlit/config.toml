@@ -1,0 +1,15 @@
+[server]
+address = "127.0.0.1"
+headless = true
+fileWatcherType = "none"
+enableCORS = true
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F6FA"
+textColor = "#172033"
